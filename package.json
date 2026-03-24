@@ -1,22 +1,354 @@
-{
-  "name": "pinnacle-planning-backend",
-  "version": "1.0.0",
-  "description": "Pinnacle Property Broker — Live Planning Alert Backend",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "dev": "nodemon server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "node-cron": "^3.0.3",
-    "@sendgrid/mail": "^8.1.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+// ============================================================
+// PINNACLE PROPERTY BROKER — Planning Alert Backend
+// Using api.planning.org.uk (FREE)
+// ============================================================
+// Environment variables needed in Railway:
+//   PLANNING_API_KEY = 73vctsvl4j0fyag5
+//   SENDGRID_API_KEY = your sendgrid key
+//   ALERT_EMAIL      = zack@pinnaclepropertybroker.com
+//   FROM_EMAIL       = zack@pinnaclepropertybroker.com
+// ============================================================
+
+const express = require('express');
+const cors = require('cors');
+const cron = require('node-cron');
+const sgMail = require('@sendgrid/mail');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ── Config ─────────────────────────────────────────────────
+const PLANNING_API_KEY = process.env.PLANNING_API_KEY;
+const PLANNING_BASE    = 'https://api.planning.org.uk/v1';
+const ALERT_EMAIL      = process.env.ALERT_EMAIL || 'zack@pinnaclepropertybroker.com';
+const FROM_EMAIL       = process.env.FROM_EMAIL  || 'zack@pinnaclepropertybroker.com';
+const MIN_UNITS        = 30;
+
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+// ── Your 7 target areas mapped to LPA IDs ─────────────────
+// These are the exact LPA names used by api.planning.org.uk
+const TARGET_LPAS = [
+  // Manchester
+  { name: 'manchester',        area: 'Manchester' },
+  { name: 'salford',           area: 'Manchester' },
+  { name: 'trafford',          area: 'Manchester' },
+  { name: 'stockport',         area: 'Manchester' },
+  { name: 'oldham',            area: 'Manchester' },
+  { name: 'bolton',            area: 'Manchester' },
+  { name: 'bury',              area: 'Manchester' },
+  { name: 'rochdale',          area: 'Manchester' },
+  { name: 'tameside',          area: 'Manchester' },
+  { name: 'wigan',             area: 'Manchester' },
+  // Cornwall
+  { name: 'cornwall',          area: 'Cornwall'   },
+  // Devon
+  { name: 'devon',             area: 'Devon'      },
+  { name: 'plymouth',          area: 'Devon'      },
+  { name: 'torbay',            area: 'Devon'      },
+  // Leicester
+  { name: 'leicester',         area: 'Leicester'  },
+  { name: 'leicestershire',    area: 'Leicester'  },
+  // Derby
+  { name: 'derby',             area: 'Derby'      },
+  { name: 'derbyshire',        area: 'Derby'      },
+  // Birmingham
+  { name: 'birmingham',        area: 'Birmingham' },
+  { name: 'coventry',          area: 'Birmingham' },
+  { name: 'dudley',            area: 'Birmingham' },
+  { name: 'sandwell',          area: 'Birmingham' },
+  { name: 'solihull',          area: 'Birmingham' },
+  { name: 'walsall',           area: 'Birmingham' },
+  { name: 'wolverhampton',     area: 'Birmingham' },
+  // Bristol
+  { name: 'bristol',           area: 'Bristol'    },
+  { name: 'bath-and-northeast-somerset', area: 'Bristol' },
+  { name: 'south-gloucestershire',       area: 'Bristol' },
+];
+
+// ── Memory store of seen IDs (prevents duplicate alerts) ───
+const seenIds = new Set();
+let lastCheckTime = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+let allApplications = []; // cached results
+
+// ── Get LPA list from API to map names to IDs ──────────────
+let lpaMap = {}; // { 'manchester': 42, 'salford': 87, ... }
+
+async function loadLPAs() {
+  try {
+    console.log('📋 Loading LPA list from planning API...');
+    const res = await fetch(`${PLANNING_BASE}/lpas`);
+    const data = await res.json();
+    const lpas = data?.response?.data || [];
+    lpas.forEach(lpa => {
+      lpaMap[lpa.name.toLowerCase()] = lpa.id;
+    });
+    console.log(`✅ Loaded ${lpas.length} LPAs`);
+  } catch(e) {
+    console.error('❌ Failed to load LPAs:', e.message);
   }
 }
+
+// ── Fetch applications for a single LPA ───────────────────
+async function fetchForLPA(lpaName, area, dateFrom) {
+  const lpaId = lpaMap[lpaName.toLowerCase()];
+  if (!lpaId) {
+    console.log(`⚠️  LPA not found: ${lpaName}`);
+    return [];
+  }
+
+  try {
+    const params = new URLSearchParams({
+      key: PLANNING_API_KEY,
+      lpa_id: lpaId,
+      return_data: '1',
+      date_from: dateFrom || '2025-01-01',
+    });
+
+    const res = await fetch(`${PLANNING_BASE}/search?${params}`);
+    const data = await res.json();
+    const apps = data?.response?.data || [];
+
+    // Filter for 30+ units by parsing description
+    const filtered = apps.filter(app => {
+      const title = (app.title || '').toLowerCase();
+      const desc  = (app.description || '').toLowerCase();
+
+      // Look for unit counts in the title/description
+      const unitPatterns = [
+        /(\d+)\s*(dwelling|dwellings|unit|units|apartment|apartments|flat|flats|home|homes|house|houses)/i,
+        /(dwelling|dwellings|unit|units|apartment|apartments|flat|flats)\s*[x:]\s*(\d+)/i,
+      ];
+
+      for (const pattern of unitPatterns) {
+        const match = (title + ' ' + desc).match(pattern);
+        if (match) {
+          const num = parseInt(match[1]) || parseInt(match[2]);
+          if (num >= MIN_UNITS) return true;
+        }
+      }
+
+      // Also include if marked as major development with residential keywords
+      const isResidential = title.includes('residential') || title.includes('dwelling') ||
+                            title.includes('apartment') || title.includes('flat') ||
+                            title.includes('housing') || title.includes('homes');
+      const isMajor = app.app_type === 'Major' || (app.app_size || '').toLowerCase().includes('major');
+
+      return isResidential && isMajor;
+    });
+
+    return filtered.map(app => mapApplication(app, area, lpaName));
+  } catch(e) {
+    console.error(`❌ Error fetching ${lpaName}:`, e.message);
+    return [];
+  }
+}
+
+// ── Map API response to dashboard format ──────────────────
+function mapApplication(app, area, lpaName) {
+  // Extract unit count from title
+  let units = 0;
+  const unitMatch = (app.title || '').match(/(\d+)\s*(dwelling|unit|apartment|flat|home|house)/i);
+  if (unitMatch) units = parseInt(unitMatch[1]);
+
+  // Determine status
+  let status = 'awaiting';
+  const dec = (app.decision || '').toLowerCase();
+  if (dec.includes('approv') || dec.includes('grant')) status = 'approved';
+  if (dec.includes('refus'))  status = 'refused';
+  if (dec.includes('withdraw')) status = 'withdrawn';
+
+  return {
+    id:          app.keyval || app.reference || Math.random().toString(36).substr(2,9),
+    address:     app.address || 'Address not available',
+    units:       units || 0,
+    status,
+    council:     app.authority_name || lpaName,
+    area,
+    type:        'Residential',
+    proposal:    app.title || '',
+    submitted:   app.validated || app.received_date || '',
+    lastUpdate:  app.decision_date || app.validated || '',
+    portalUrl:   app.url || app.external_url || '',
+    applicant: {
+      name:    app.applicant_name    || 'Not listed',
+      contact: app.applicant_name    || '—',
+      email:   app.applicant_email   || '—',
+      phone:   app.applicant_phone   || '—',
+      address: app.applicant_address || '—',
+    },
+    agent: {
+      name:    app.agent_name    || 'Not listed',
+      contact: app.agent_name    || '—',
+      email:   app.agent_email   || '—',
+      phone:   app.agent_phone   || '—',
+    },
+  };
+}
+
+// ── Fetch ALL applications across all target LPAs ─────────
+async function fetchAllApplications(dateFrom) {
+  console.log(`🔍 Fetching applications for ${TARGET_LPAS.length} councils...`);
+  const results = [];
+
+  for (const lpa of TARGET_LPAS) {
+    const apps = await fetchForLPA(lpa.name, lpa.area, dateFrom);
+    results.push(...apps);
+    // Small delay to be respectful to the API
+    await new Promise(r => setTimeout(r, 200));
+  }
+
+  console.log(`✅ Found ${results.length} matching applications total`);
+  return results;
+}
+
+// ── Send alert email ───────────────────────────────────────
+async function sendAlertEmail(newApps) {
+  if (!newApps.length || !process.env.SENDGRID_API_KEY) return;
+
+  const subject = newApps.length === 1
+    ? `🔔 New Site: ${newApps[0].address}`
+    : `🔔 ${newApps.length} New Planning Applications — Pinnacle Alert`;
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto;background:#f5f5f5;padding:20px;">
+      <div style="background:#000;padding:20px;border-radius:8px 8px 0 0;">
+        <h1 style="color:#c8a96e;margin:0;font-size:22px;">▲ PINNACLE PROPERTY BROKER</h1>
+        <p style="color:#666;margin:5px 0 0;font-size:13px;">Planning Intelligence Alert · ${new Date().toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'})}</p>
+      </div>
+      <div style="background:#fff;padding:24px;border-radius:0 0 8px 8px;">
+        <h2 style="color:#111;font-size:18px;margin-top:0;">${newApps.length} New Application${newApps.length>1?'s':''} Found</h2>
+        ${newApps.map(app => `
+          <div style="border:1px solid #e0e0e0;border-left:4px solid ${app.status==='approved'?'#00d26e':'#ffab00'};border-radius:6px;padding:16px;margin-bottom:16px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:10px;">
+              <div>
+                <h3 style="margin:0 0 4px;color:#111;font-size:15px;">${app.address}</h3>
+                <span style="font-size:12px;color:#888;">${app.council} · ${app.area}</span>
+              </div>
+              <span style="background:${app.status==='approved'?'#e6f9f0':'#fff8e6'};color:${app.status==='approved'?'#00a854':'#d48000'};padding:4px 10px;border-radius:20px;font-size:11px;font-weight:bold;white-space:nowrap;margin-left:12px;">
+                ${app.status==='approved'?'✅ FULL CONSENT':'⏳ AWAITING'}
+              </span>
+            </div>
+            <div style="font-size:13px;margin-bottom:12px;">
+              <strong>Units:</strong> <span style="color:#c8a96e;font-weight:bold;font-size:16px;">${app.units||'Major'}</span> &nbsp;·&nbsp;
+              <strong>Submitted:</strong> ${app.submitted?new Date(app.submitted).toLocaleDateString('en-GB'):'—'}
+            </div>
+            ${app.proposal?`<div style="font-size:12px;color:#666;font-style:italic;margin-bottom:12px;padding:8px;background:#f9f9f9;border-radius:4px;">"${app.proposal.substring(0,200)}${app.proposal.length>200?'...':''}"</div>`:''}
+            <div style="background:#f0f0f0;padding:12px;border-radius:5px;margin-bottom:10px;font-size:13px;">
+              <strong style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.05em;">Applicant</strong><br/>
+              <strong>${app.applicant.name}</strong>
+              ${app.applicant.email!=='—'?`<br/>📧 <a href="mailto:${app.applicant.email}" style="color:#1a73e8;">${app.applicant.email}</a>`:''}
+              ${app.applicant.phone!=='—'?`<br/>📞 ${app.applicant.phone}`:''}
+            </div>
+            ${app.agent.name!=='Not listed'?`
+            <div style="background:#f0f0f0;padding:12px;border-radius:5px;margin-bottom:10px;font-size:13px;">
+              <strong style="font-size:11px;color:#555;text-transform:uppercase;letter-spacing:0.05em;">Planning Agent</strong><br/>
+              <strong>${app.agent.name}</strong>
+              ${app.agent.email!=='—'?`<br/>📧 <a href="mailto:${app.agent.email}" style="color:#1a73e8;">${app.agent.email}</a>`:''}
+              ${app.agent.phone!=='—'?`<br/>📞 ${app.agent.phone}`:''}
+            </div>`:''}
+            ${app.portalUrl?`<a href="${app.portalUrl}" style="display:inline-block;background:#000;color:#c8a96e;padding:8px 16px;border-radius:5px;text-decoration:none;font-size:13px;font-weight:bold;">View on Council Portal →</a>`:''}
+          </div>
+        `).join('')}
+        <div style="margin-top:20px;padding-top:16px;border-top:1px solid #e0e0e0;font-size:12px;color:#999;text-align:center;">
+          Pinnacle Property Broker Ltd · Planning Intelligence Platform<br/>
+          Monitoring Manchester · Cornwall · Devon · Leicester · Derby · Birmingham · Bristol
+        </div>
+      </div>
+    </div>
+  `;
+
+  await sgMail.send({
+    to: ALERT_EMAIL,
+    from: FROM_EMAIL,
+    subject,
+    html,
+    text: newApps.map(a => `${a.address} | ${a.units} units | ${a.council} | ${a.status}\nApplicant: ${a.applicant.name} ${a.applicant.email}\n${a.portalUrl}`).join('\n\n---\n\n'),
+  });
+
+  console.log(`✅ Alert sent for ${newApps.length} applications to ${ALERT_EMAIL}`);
+}
+
+// ── Hourly check for new applications ─────────────────────
+async function checkForNew() {
+  console.log(`\n⏰ Hourly check — ${new Date().toLocaleTimeString('en-GB')}`);
+  try {
+    const dateFrom = lastCheckTime.split('T')[0];
+    const apps = await fetchAllApplications(dateFrom);
+
+    const newOnes = apps.filter(a => !seenIds.has(a.id));
+
+    if (newOnes.length > 0) {
+      console.log(`🚨 ${newOnes.length} NEW applications found!`);
+      newOnes.forEach(a => seenIds.add(a.id));
+      allApplications = [...newOnes, ...allApplications];
+      await sendAlertEmail(newOnes);
+    } else {
+      console.log('✓ No new applications');
+    }
+
+    lastCheckTime = new Date().toISOString();
+  } catch(e) {
+    console.error('❌ Check failed:', e.message);
+  }
+}
+
+// ── Routes ─────────────────────────────────────────────────
+
+// Dashboard data feed
+app.get('/api/applications', async (req, res) => {
+  try {
+    // If cache is empty, fetch now
+    if (allApplications.length === 0) {
+      allApplications = await fetchAllApplications('2025-01-01');
+      allApplications.forEach(a => seenIds.add(a.id));
+    }
+    res.json({ success: true, count: allApplications.length, data: allApplications });
+  } catch(e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Force a fresh check
+app.post('/api/check-now', async (req, res) => {
+  await checkForNew();
+  res.json({ success: true, count: allApplications.length });
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    lastCheck: lastCheckTime,
+    applicationsLoaded: allApplications.length,
+    newAlertsTracked: seenIds.size,
+    targetAreas: ['Manchester','Cornwall','Devon','Leicester','Derby','Birmingham','Bristol'],
+    minUnits: MIN_UNITS,
+    apiKeyLoaded: !!PLANNING_API_KEY,
+  });
+});
+
+// ── Start ──────────────────────────────────────────────────
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, async () => {
+  console.log(`
+  ▲ PINNACLE PROPERTY BROKER
+  Planning Alert Backend — port ${PORT}
+  Areas: Manchester · Cornwall · Devon · Leicester · Derby · Birmingham · Bristol
+  Min Units: ${MIN_UNITS}+
+  Alert Email: ${ALERT_EMAIL}
+  `);
+
+  // Load LPA IDs then fetch initial data
+  await loadLPAs();
+  await fetchAllApplications('2025-01-01').then(apps => {
+    allApplications = apps;
+    apps.forEach(a => seenIds.add(a.id));
+    console.log(`🚀 Initial load complete — ${apps.length} applications ready`);
+  });
+});
+
+// Run check every hour
+cron.schedule('0 * * * *', checkForNew);
