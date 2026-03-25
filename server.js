@@ -296,14 +296,14 @@ app.get("/api/applications/:id", (req, res) => {
 });
 
 // Force refresh
-app.post("/api/refresh", async (req, res) => {
+app.get("/api/refresh", async (req, res) => {
   cache = await fetchAll("2024-01-01");
   cache.forEach(a => seenIds.add(a.id));
   res.json({ success: true, count: cache.length });
 });
 
 // Manual alert check
-app.post("/api/check-now", async (req, res) => {
+app.get("/api/check-now", async (req, res) => {
   await hourlyCheck();
   res.json({ success: true, count: cache.length });
 });
