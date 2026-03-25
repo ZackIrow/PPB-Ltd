@@ -7,9 +7,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─────────────────────────────────────────────
-// CONFIG
-// PlanIt.org.uk — 100% FREE, no API key needed
-// 417 UK planning authorities, 20M applications
+// CONFIG — PlanIt.org.uk, 100% FREE
 // ─────────────────────────────────────────────
 const PLANIT_BASE  = "https://www.planit.org.uk";
 const ALERT_EMAIL  = process.env.ALERT_EMAIL  || "zack@pinnaclepropertybroker.com";
@@ -62,6 +60,8 @@ function extractUnits(text) {
     /(erection|construction|development|provision)\s+of\s+(\d{2,4})\s*(no\.?\s*)?(residential|dwelling|apartment|flat|unit|home)/i,
     /(\d{2,4})\s*x\s*(dwelling|unit|apartment|flat|bed)/i,
     /comprising\s+(\d{2,4})\s*(residential|dwelling|apartment|flat|unit)/i,
+    /total\s+of\s+(\d{2,4})\s*(residential|dwelling|apartment|flat|unit|home)/i,
+    /(\d{2,4})\s*(?:no\.?\s*)?(?:new\s*)?(?:residential\s*)?(?:affordable\s*)?(?:dwelling|unit|apartment|flat|home)/i,
   ];
   for (const p of patterns) {
     const m = text.match(p);
@@ -82,94 +82,127 @@ function isResidential(text) {
          t.includes("house")     || t.includes("affordable");
 }
 
-function mapStatus(decision, status) {
-  const combined = ((decision || "") + " " + (status || "")).toLowerCase();
+function mapStatus(appState, decision) {
+  const combined = ((appState || "") + " " + (decision || "")).toLowerCase();
   if (combined.includes("approv") || combined.includes("grant") || combined.includes("permitted")) return "approved";
   if (combined.includes("refus"))    return "refused";
   if (combined.includes("withdraw")) return "withdrawn";
   return "awaiting";
 }
 
-// PlanIt stores extra fields inside other_fields object
 function mapApp(raw, area) {
-  const of      = raw.other_fields || {};
-  const desc    = raw.description  || "";
-  const units   = extractUnits(desc);
+  const of    = raw.other_fields || {};
+  const desc  = raw.description  || "";
+  const units = extractUnits(desc);
 
   return {
     id:        raw.name || raw.uid || String(Math.random()),
-    reference: raw.uid  || of.date_validated || "—",
+    reference: raw.uid  || "—",
     address:   raw.address || "Address not available",
     proposal:  desc,
     units,
-    status:    mapStatus(of.decision, of.status),
+    status:    mapStatus(raw.app_state, of.decision || of.status),
     council:   raw.area_name || "—",
     area,
-    submitted: raw.start_date || of.date_received || of.date_validated || "",
-    decided:   of.decision_date || of.decision_issued_date || "",
-    portalUrl: raw.link || of.comment_url || "",
+    appSize:   raw.app_size  || "—",
+    appType:   raw.app_type  || "—",
+    submitted: raw.start_date || of.date_received || "",
+    decided:   raw.decided_date || of.decision_date || "",
+    portalUrl: raw.url || raw.link || "",
     applicant: {
       name:    of.applicant_name    || of.applicant_company || "Not listed",
       company: of.applicant_company || "—",
+      address: of.applicant_address || "—",
       email:   "—",
       phone:   "—",
-      address: of.applicant_address || "—",
     },
     agent: {
       name:    of.agent_name    || of.agent_company || "—",
       company: of.agent_company || "—",
+      address: of.agent_address || "—",
       email:   "—",
       phone:   "—",
-      address: of.agent_address || "—",
     },
   };
 }
 
 // ─────────────────────────────────────────────
-// FETCH ONE COUNCIL
+// FETCH ONE COUNCIL — TWO PASSES
+// Pass 1: app_size=Major (catches large schemes even without unit numbers)
+// Pass 2: keyword search for unit numbers in description
 // ─────────────────────────────────────────────
 async function fetchCouncil(auth, area) {
+  const results = [];
+  const seen    = new Set();
+
+  // ── PASS 1: Major residential applications ──
   try {
-    // Use search keyword for residential and recent 365 days
-    // No app_size filter — PlanIt's Major filter may be too restrictive
     const params = new URLSearchParams({
       auth:     auth,
-      search:   "dwelling OR dwellings OR residential OR apartments OR flats OR housing",
+      app_size: "Major",
+      search:   "residential OR dwelling OR apartments OR flats OR housing OR homes",
       recent:   "365",
       pg_sz:    "300",
       compress: "on",
     });
 
-    const url = `${PLANIT_BASE}/api/applics/json?${params}`;
-    console.log(`Fetching ${auth}...`);
-
-    const r = await fetch(url, {
+    const r = await fetch(`${PLANIT_BASE}/api/applics/json?${params}`, {
       headers: { "User-Agent": "Pinnacle-Property-Broker/1.0" }
     });
 
-    if (!r.ok) {
-      console.log(`${auth}: HTTP ${r.status}`);
-      return [];
+    if (r.ok) {
+      const d = await r.json();
+      const records = d.records || [];
+      console.log(`${auth} [Major]: ${records.length} applications`);
+
+      for (const a of records) {
+        if (!seen.has(a.name)) {
+          seen.add(a.name);
+          results.push(mapApp(a, area));
+        }
+      }
     }
+  } catch(e) {
+    console.error(`${auth} Pass 1 error:`, e.message);
+  }
 
-    const d       = await r.json();
-    const records = d.records || [];
-    console.log(`${auth}: ${records.length} residential applications found`);
+  await new Promise(r => setTimeout(r, 800));
 
-    // Filter for 30+ units
-    const filtered = records.filter(a => {
-      const desc  = a.description || "";
-      const units = extractUnits(desc);
-      return units >= MIN_UNITS;
+  // ── PASS 2: Any size but with 30+ unit numbers in description ──
+  try {
+    const params = new URLSearchParams({
+      auth:     auth,
+      search:   "dwellings OR apartments OR flats OR \"residential units\"",
+      recent:   "365",
+      pg_sz:    "300",
+      compress: "on",
     });
 
-    console.log(`${auth}: ${filtered.length} with 30+ units`);
-    return filtered.map(a => mapApp(a, area));
+    const r = await fetch(`${PLANIT_BASE}/api/applics/json?${params}`, {
+      headers: { "User-Agent": "Pinnacle-Property-Broker/1.0" }
+    });
 
+    if (r.ok) {
+      const d = await r.json();
+      const records = d.records || [];
+      console.log(`${auth} [Keywords]: ${records.length} applications`);
+
+      for (const a of records) {
+        if (!seen.has(a.name)) {
+          const units = extractUnits(a.description || "");
+          if (units >= MIN_UNITS) {
+            seen.add(a.name);
+            results.push(mapApp(a, area));
+          }
+        }
+      }
+    }
   } catch(e) {
-    console.error(`Failed ${auth}:`, e.message);
-    return [];
+    console.error(`${auth} Pass 2 error:`, e.message);
   }
+
+  console.log(`${auth}: ${results.length} qualifying applications`);
+  return results;
 }
 
 // ─────────────────────────────────────────────
@@ -177,25 +210,28 @@ async function fetchCouncil(auth, area) {
 // ─────────────────────────────────────────────
 async function fetchAll() {
   loading = true;
-  console.log("\nFetching from PlanIt.org.uk (FREE)...");
+  console.log("\nFetching all councils from PlanIt.org.uk...");
   const results = [];
 
   for (const c of COUNCILS) {
     const apps = await fetchCouncil(c.auth, c.area);
     results.push(...apps);
-    await new Promise(r => setTimeout(r, 1500)); // rate limit respect
+    await new Promise(r => setTimeout(r, 1000));
   }
 
-  // Deduplicate
+  // Global deduplicate
   const unique = [];
   const seen   = new Set();
   for (const a of results) {
     if (!seen.has(a.id)) { seen.add(a.id); unique.push(a); }
   }
 
+  // Sort by submitted date, newest first
+  unique.sort((a, b) => new Date(b.submitted || 0) - new Date(a.submitted || 0));
+
   loading     = false;
   lastUpdated = new Date().toISOString();
-  console.log(`\nDone — ${unique.length} applications across all areas`);
+  console.log(`\nComplete — ${unique.length} total qualifying applications`);
   return unique;
 }
 
@@ -221,10 +257,13 @@ async function sendAlert(newApps) {
             <div style="border:1px solid #ddd;border-left:4px solid ${a.status==="approved"?"#00c96e":"#ffab00"};border-radius:6px;padding:14px;margin-bottom:14px;">
               <h3 style="margin:0 0 4px;font-size:14px;">${a.address}</h3>
               <p style="margin:0 0 6px;font-size:12px;color:#888;">${a.council} · ${a.area} · Ref: ${a.reference}</p>
-              <p style="margin:0 0 8px;font-size:13px;"><strong>Units:</strong> <span style="color:#c8a96e;font-weight:bold;">${a.units||"Major"}</span> &nbsp;·&nbsp; <strong>Status:</strong> ${a.status==="approved"?"✅ FULL CONSENT":"⏳ AWAITING"}</p>
+              <p style="margin:0 0 8px;font-size:13px;">
+                <strong>Units:</strong> <span style="color:#c8a96e;font-weight:bold;">${a.units||"Major scheme"}</span> &nbsp;·&nbsp;
+                <strong>Status:</strong> ${a.status==="approved"?"✅ FULL CONSENT":"⏳ AWAITING"}
+              </p>
               ${a.proposal?`<p style="font-size:12px;color:#666;font-style:italic;margin-bottom:10px;">"${a.proposal.substring(0,200)}..."</p>`:""}
-              <p style="font-size:13px;margin-bottom:8px;"><strong>Applicant:</strong> ${a.applicant.name} ${a.applicant.company!=="—"?`(${a.applicant.company})`:""}</p>
-              ${a.agent.name!=="—"?`<p style="font-size:13px;margin-bottom:8px;"><strong>Agent:</strong> ${a.agent.name}</p>`:""}
+              <p style="font-size:13px;margin-bottom:6px;"><strong>Applicant:</strong> ${a.applicant.name}${a.applicant.company!=="—"?` · ${a.applicant.company}`:""}</p>
+              ${a.agent.name!=="—"?`<p style="font-size:13px;margin-bottom:10px;"><strong>Agent:</strong> ${a.agent.name}</p>`:""}
               ${a.portalUrl?`<a href="${a.portalUrl}" style="display:inline-block;background:#000;color:#c8a96e;padding:8px 14px;border-radius:4px;text-decoration:none;font-size:12px;font-weight:bold;">View Application →</a>`:""}
             </div>
           `).join("")}
@@ -268,15 +307,15 @@ async function hourlyCheck() {
 // ─────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
-    status:      "ok",
+    status:       "ok",
     applications: cache.length,
     lastUpdated,
     loading,
-    source:      "PlanIt.org.uk (free)",
-    councils:    COUNCILS.length,
-    areas:       ["Manchester","Birmingham","Bristol","Cornwall"],
-    minUnits:    MIN_UNITS,
-    emailAlerts: !!SENDGRID_KEY,
+    source:       "PlanIt.org.uk (free)",
+    councils:     COUNCILS.length,
+    areas:        ["Manchester","Birmingham","Bristol","Cornwall"],
+    minUnits:     MIN_UNITS,
+    emailAlerts:  !!SENDGRID_KEY,
   });
 });
 
@@ -299,21 +338,10 @@ app.get("/api/check-now", async (req, res) => {
   res.json({ success:true, count:cache.length });
 });
 
-// Debug — test a single council
+// Single council test
 app.get("/api/test/:council", async (req, res) => {
-  const council = req.params.council;
-  const params  = new URLSearchParams({
-    auth:    council,
-    search:  "dwelling OR residential OR apartments OR flats",
-    recent:  "90",
-    pg_sz:   "5",
-    compress:"on",
-  });
-  const r = await fetch(`${PLANIT_BASE}/api/applics/json?${params}`, {
-    headers: { "User-Agent":"Pinnacle-Property-Broker/1.0" }
-  });
-  const d = await r.json();
-  res.json({ council, total:d.total, count:(d.records||[]).length, sample:d.records?.slice(0,2) });
+  const apps = await fetchCouncil(req.params.council, "Test");
+  res.json({ council:req.params.council, count:apps.length, data:apps.slice(0,5) });
 });
 
 // ─────────────────────────────────────────────
