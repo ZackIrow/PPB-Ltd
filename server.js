@@ -3,7 +3,9 @@ const cors = require("cors");
 const cron = require("node-cron");
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: "*", methods: ["GET","POST"], allowedHeaders: ["Content-Type","Authorization"] }));
+app.use(express.json());
+app.options("*", cors());
 app.use(express.json());
 
 // ─────────────────────────────────────────────
