@@ -9,7 +9,7 @@ app.use(express.json());
 
 const PLANIT_BASE  = "https://www.planit.org.uk";
 const CH_BASE      = "https://api.company-information.service.gov.uk";
-const CH_API_KEY   = process.env.COMPANIES_HOUSE_API_KEY;
+const CH_API_KEY = process.env.COMPANIES_HOUSE_API_KEY || "654b2208-fd5f-4958-aa54-f192ea505b83";
 const ALERT_EMAIL  = process.env.ALERT_EMAIL  || "zack@pinnaclepropertybroker.com";
 const SENDGRID_KEY = process.env.SENDGRID_API_KEY;
 const MIN_UNITS    = 30;
