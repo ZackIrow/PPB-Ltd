@@ -1,18 +1,1 @@
-{
-  "name": "pinnacle-planning-backend",
-  "version": "1.0.0",
-  "description": "Pinnacle Property Broker Planning Alert Backend",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "node-cron": "^3.0.3",
-    "@sendgrid/mail": "^8.1.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
-}
+
